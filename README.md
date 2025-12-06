@@ -1,5 +1,7 @@
 # moment-rele
 
+> R.E.L.E すべての更新は記録される。
+
 Shared GitHub Actions workflows and composite actions for the Moment organization.
 
 ## Available Actions
