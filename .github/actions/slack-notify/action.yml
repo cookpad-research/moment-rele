@@ -1,0 +1,188 @@
+name: 'Slack Notification'
+description: 'Send formatted Slack notifications for CI/CD events'
+author: 'Cookpad Research'
+branding:
+  icon: 'message-square'
+  color: 'purple'
+
+inputs:
+  status:
+    description: 'Workflow status: success, failure, cancelled'
+    required: true
+  type:
+    description: 'Notification type: build, deploy-staging, deploy-production, release, test, ci, review'
+    required: true
+  title:
+    description: 'Notification title (e.g., app name)'
+    required: true
+  slack-webhook-url:
+    description: 'Slack incoming webhook URL'
+    required: true
+  version:
+    description: 'App version'
+    required: false
+    default: ''
+  environment:
+    description: 'Deployment environment (staging/production)'
+    required: false
+    default: ''
+  changelog:
+    description: 'Changelog content (for releases)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine status styling
+      id: styling
+      shell: bash
+      run: |
+        case "${{ inputs.status }}" in
+          success)
+            echo "color=good" >> $GITHUB_OUTPUT
+            echo "emoji=:white_check_mark:" >> $GITHUB_OUTPUT
+            echo "status_text=Success" >> $GITHUB_OUTPUT
+            ;;
+          failure)
+            echo "color=danger" >> $GITHUB_OUTPUT
+            echo "emoji=:x:" >> $GITHUB_OUTPUT
+            echo "status_text=Failed" >> $GITHUB_OUTPUT
+            ;;
+          cancelled)
+            echo "color=warning" >> $GITHUB_OUTPUT
+            echo "emoji=:warning:" >> $GITHUB_OUTPUT
+            echo "status_text=Cancelled" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "color=#808080" >> $GITHUB_OUTPUT
+            echo "emoji=:grey_question:" >> $GITHUB_OUTPUT
+            echo "status_text=Unknown" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    - name: Determine type prefix
+      id: type-prefix
+      shell: bash
+      run: |
+        case "${{ inputs.type }}" in
+          build) echo "prefix=Build" >> $GITHUB_OUTPUT ;;
+          deploy-staging) echo "prefix=Staging Deploy" >> $GITHUB_OUTPUT ;;
+          deploy-production) echo "prefix=Production Deploy" >> $GITHUB_OUTPUT ;;
+          release) echo "prefix=Release" >> $GITHUB_OUTPUT ;;
+          test) echo "prefix=Tests" >> $GITHUB_OUTPUT ;;
+          ci) echo "prefix=CI" >> $GITHUB_OUTPUT ;;
+          review) echo "prefix=Store Review" >> $GITHUB_OUTPUT ;;
+          *) echo "prefix=${{ inputs.type }}" >> $GITHUB_OUTPUT ;;
+        esac
+
+    - name: Build payload JSON
+      id: build-payload
+      shell: bash
+      env:
+        INPUT_TITLE: ${{ inputs.title }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        INPUT_CHANGELOG: ${{ inputs.changelog }}
+        STATUS_EMOJI: ${{ steps.styling.outputs.emoji }}
+        STATUS_TEXT: ${{ steps.styling.outputs.status_text }}
+        STATUS_COLOR: ${{ steps.styling.outputs.color }}
+        TYPE_PREFIX: ${{ steps.type-prefix.outputs.prefix }}
+        REF_NAME: ${{ github.ref_name }}
+        ACTOR: ${{ github.actor }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        # Build fields array
+        FIELDS=$(jq -n \
+          --arg ref "$REF_NAME" \
+          --arg actor "$ACTOR" \
+          '[
+            {"type": "mrkdwn", "text": ("*Branch/Tag:*\n" + $ref)},
+            {"type": "mrkdwn", "text": ("*Triggered by:*\n" + $actor)}
+          ]')
+
+        # Add version field if provided
+        if [ -n "$INPUT_VERSION" ]; then
+          FIELDS=$(echo "$FIELDS" | jq --arg v "$INPUT_VERSION" '. + [{"type": "mrkdwn", "text": ("*Version:*\n" + $v)}]')
+        fi
+
+        # Add environment field if provided
+        if [ -n "$INPUT_ENVIRONMENT" ]; then
+          FIELDS=$(echo "$FIELDS" | jq --arg e "$INPUT_ENVIRONMENT" '. + [{"type": "mrkdwn", "text": ("*Environment:*\n" + $e)}]')
+        fi
+
+        # Start building blocks array
+        BLOCKS=$(jq -n \
+          --arg emoji "$STATUS_EMOJI" \
+          --arg title "$INPUT_TITLE" \
+          --arg prefix "$TYPE_PREFIX" \
+          --arg status "$STATUS_TEXT" \
+          --argjson fields "$FIELDS" \
+          --arg url "$RUN_URL" \
+          '[
+            {
+              "type": "header",
+              "text": {
+                "type": "plain_text",
+                "text": ($emoji + " " + $title + " - " + $prefix + " " + $status),
+                "emoji": true
+              }
+            },
+            {
+              "type": "section",
+              "fields": $fields
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": ("<" + $url + "|View Details>")
+              }
+            }
+          ]')
+
+        # Insert changelog block before the link if provided
+        if [ -n "$INPUT_CHANGELOG" ]; then
+          CHANGELOG_BLOCK=$(jq -n --arg cl "$INPUT_CHANGELOG" '{
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": ("*Changelog:*\n" + $cl)
+            }
+          }')
+          # Insert at position 2 (before link)
+          BLOCKS=$(echo "$BLOCKS" | jq --argjson cb "$CHANGELOG_BLOCK" '.[0:2] + [$cb] + .[2:]')
+        fi
+
+        # Build final payload
+        PAYLOAD=$(jq -n \
+          --arg color "$STATUS_COLOR" \
+          --argjson blocks "$BLOCKS" \
+          '{
+            "attachments": [
+              {
+                "color": $color,
+                "blocks": $blocks
+              }
+            ]
+          }')
+
+        # Save to file
+        echo "$PAYLOAD" > /tmp/slack-payload.json
+
+    - name: Send Slack notification
+      shell: bash
+      run: |
+        response=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.slack-webhook-url }}" \
+          -H 'Content-type: application/json' \
+          -d @/tmp/slack-payload.json)
+
+        http_code=$(echo "$response" | tail -n1)
+        body=$(echo "$response" | sed '$d')
+
+        if [ "$http_code" != "200" ]; then
+          echo "::warning::Slack notification failed with HTTP $http_code: $body"
+        fi
+
+        # Clean up
+        rm -f /tmp/slack-payload.json

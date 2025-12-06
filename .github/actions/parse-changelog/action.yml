@@ -1,0 +1,93 @@
+name: 'Parse Changelog'
+description: 'Extract and format changelog from release body or auto-generate'
+author: 'Cookpad Research'
+branding:
+  icon: 'file-text'
+  color: 'blue'
+
+inputs:
+  mode:
+    description: 'Mode: release-body (parse provided body) or auto-generate (use changelog builder)'
+    required: false
+    default: 'release-body'
+  release-body:
+    description: 'Release body content to parse (for release-body mode)'
+    required: false
+    default: ''
+  max-length:
+    description: 'Maximum character length for changelog (Slack limit is ~3000)'
+    required: false
+    default: '2000'
+  github-token:
+    description: 'GitHub token for auto-generate mode'
+    required: false
+    default: ''
+
+outputs:
+  changelog:
+    description: 'Formatted changelog text (Slack-compatible)'
+    value: ${{ steps.parse.outputs.changelog }}
+  has-changelog:
+    description: 'Whether a changelog was found/generated'
+    value: ${{ steps.parse.outputs.has_changelog }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Auto-generate changelog
+      if: inputs.mode == 'auto-generate' && inputs.github-token != ''
+      id: auto-changelog
+      uses: mikepenz/release-changelog-builder-action@v5
+      with:
+        token: ${{ inputs.github-token }}
+        outputFile: ''
+      continue-on-error: true
+
+    - name: Parse and format changelog
+      id: parse
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_BODY: ${{ inputs.release-body }}
+        AUTO_CHANGELOG: ${{ steps.auto-changelog.outputs.changelog }}
+        MAX_LENGTH: ${{ inputs.max-length }}
+      run: |
+        # Get raw changelog based on mode
+        if [ "$INPUT_MODE" = "auto-generate" ] && [ -n "$AUTO_CHANGELOG" ]; then
+          RAW_CHANGELOG="$AUTO_CHANGELOG"
+        else
+          RAW_CHANGELOG="$INPUT_BODY"
+        fi
+
+        # Check if empty
+        if [ -z "$RAW_CHANGELOG" ]; then
+          echo "changelog=" >> $GITHUB_OUTPUT
+          echo "has_changelog=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Format for Slack:
+        # - Convert markdown headers to bold
+        # - Convert bullet points
+        # - Limit length
+        FORMATTED=$(echo "$RAW_CHANGELOG" | \
+          sed 's/^### \(.*\)/*\1*/g' | \
+          sed 's/^## \(.*\)/*\1*/g' | \
+          sed 's/^# \(.*\)/*\1*/g' | \
+          head -c "$MAX_LENGTH")
+
+        # Add ellipsis if truncated
+        ORIGINAL_LENGTH=${#RAW_CHANGELOG}
+        if [ "$ORIGINAL_LENGTH" -gt "$MAX_LENGTH" ]; then
+          FORMATTED="${FORMATTED}..."
+        fi
+
+        # Escape for GitHub Actions output (handle newlines)
+        # Use EOF delimiter for multi-line output
+        {
+          echo "changelog<<CHANGELOG_EOF"
+          echo "$FORMATTED"
+          echo "CHANGELOG_EOF"
+        } >> $GITHUB_OUTPUT
+
+        echo "has_changelog=true" >> $GITHUB_OUTPUT
