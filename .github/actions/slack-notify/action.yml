@@ -30,6 +30,14 @@ inputs:
     description: 'Changelog content (for releases)'
     required: false
     default: ''
+  mentions:
+    description: 'Slack user group IDs (e.g., "S0AC8FPCFMW") or user IDs (e.g., "U12345") to mention. Comma-separated for multiple. Can also use pre-formatted strings like "<!subteam^ID>"'
+    required: false
+    default: ''
+  mention-context:
+    description: 'Optional message to show with mentions (e.g., "Please review:", "FYI:")'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -84,6 +92,8 @@ runs:
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_ENVIRONMENT: ${{ inputs.environment }}
         INPUT_CHANGELOG: ${{ inputs.changelog }}
+        INPUT_MENTIONS: ${{ inputs.mentions }}
+        INPUT_MENTION_CONTEXT: ${{ inputs.mention-context }}
         STATUS_EMOJI: ${{ steps.styling.outputs.emoji }}
         STATUS_TEXT: ${{ steps.styling.outputs.status_text }}
         STATUS_COLOR: ${{ steps.styling.outputs.color }}
@@ -109,6 +119,48 @@ runs:
         # Add environment field if provided
         if [ -n "$INPUT_ENVIRONMENT" ]; then
           FIELDS=$(echo "$FIELDS" | jq --arg e "$INPUT_ENVIRONMENT" '. + [{"type": "mrkdwn", "text": ("*Environment:*\n" + $e)}]')
+        fi
+
+        # Process mentions if provided
+        if [ -n "$INPUT_MENTIONS" ]; then
+          FORMATTED_MENTIONS=""
+          IFS=',' read -ra MENTION_ARRAY <<< "$INPUT_MENTIONS"
+
+          for MENTION in "${MENTION_ARRAY[@]}"; do
+            # Trim whitespace
+            MENTION=$(echo "$MENTION" | xargs)
+
+            # Skip empty
+            if [ -z "$MENTION" ]; then
+              continue
+            fi
+
+            # Check if already formatted (starts with '<')
+            if [[ "$MENTION" == \<* ]]; then
+              FORMATTED_MENTIONS="$FORMATTED_MENTIONS $MENTION"
+            else
+              # Auto-detect type and format
+              # User group IDs start with 'S', user IDs start with 'U' or 'W'
+              if [[ "$MENTION" =~ ^S[A-Z0-9]+ ]]; then
+                FORMATTED_MENTIONS="$FORMATTED_MENTIONS <!subteam^$MENTION>"
+              elif [[ "$MENTION" =~ ^[UW][A-Z0-9]+ ]]; then
+                FORMATTED_MENTIONS="$FORMATTED_MENTIONS <@$MENTION>"
+              else
+                # Fallback: treat as user group
+                FORMATTED_MENTIONS="$FORMATTED_MENTIONS <!subteam^$MENTION>"
+              fi
+            fi
+          done
+
+          # Trim leading space
+          FORMATTED_MENTIONS=$(echo "$FORMATTED_MENTIONS" | xargs)
+
+          # Build mention text with optional context
+          if [ -n "$INPUT_MENTION_CONTEXT" ]; then
+            MENTION_TEXT="$INPUT_MENTION_CONTEXT $FORMATTED_MENTIONS"
+          else
+            MENTION_TEXT="$FORMATTED_MENTIONS"
+          fi
         fi
 
         # Start building blocks array
@@ -140,6 +192,19 @@ runs:
               }
             }
           ]')
+
+        # Insert mentions block if present
+        if [ -n "$MENTION_TEXT" ]; then
+          MENTION_BLOCK=$(jq -n --arg mt "$MENTION_TEXT" '{
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": $mt
+            }
+          }')
+          # Insert at position 2 (after header and fields, before link)
+          BLOCKS=$(echo "$BLOCKS" | jq --argjson mb "$MENTION_BLOCK" '.[0:2] + [$mb] + .[2:]')
+        fi
 
         # Insert changelog block before the link if provided
         if [ -n "$INPUT_CHANGELOG" ]; then

@@ -30,6 +30,8 @@ Send formatted Slack notifications for CI/CD events with consistent styling.
 | `version` | No | `''` | App version to display |
 | `environment` | No | `''` | Environment name (staging/production) |
 | `changelog` | No | `''` | Changelog content for release notifications |
+| `mentions` | No | `''` | Slack user group IDs (e.g., `S0AC8FPCFMW`) or user IDs (e.g., `U12345`) to mention. Comma-separated for multiple. |
+| `mention-context` | No | `''` | Optional message to show with mentions (e.g., `"Please review:"`, `"FYI:"`) |
 
 #### Usage
 
@@ -69,6 +71,56 @@ Environment: production
 
 View Details
 ```
+
+#### Mention Support
+
+You can mention Slack user groups or individual users in notifications to ensure specific teams or people are notified:
+
+**Simple user group mention:**
+```yaml
+- name: Notify Slack
+  uses: ./.moment-rele/.github/actions/slack-notify
+  with:
+    status: success
+    type: deploy-production
+    title: My App
+    version: '1.2.3'
+    mentions: 'S0AC8FPCFMW'  # User group ID
+    slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+**Multiple mentions with context:**
+```yaml
+- name: Notify Slack with mentions
+  uses: ./.moment-rele/.github/actions/slack-notify
+  with:
+    status: success
+    type: release
+    title: Learner App
+    version: '1.24.0'
+    mentions: 'S0AC8FPCFMW, S123XYZ, U456ABC'  # Multiple IDs
+    mention-context: 'Please review and push to the App Store.'
+    slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+**Conditional mentions (production only):**
+```yaml
+- name: Notify Slack
+  uses: ./.moment-rele/.github/actions/slack-notify
+  with:
+    status: ${{ steps.status.outputs.status }}
+    type: deploy-production
+    title: My App
+    mentions: ${{ needs.setup.outputs.environment == 'production' && steps.status.outputs.status == 'success' && 'S0AC8FPCFMW' || '' }}
+    mention-context: 'Deployment complete.'
+    slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+**Supported ID formats:**
+- User group IDs starting with 'S' (e.g., `S0AC8FPCFMW`) → Auto-formatted as `<!subteam^ID>`
+- User IDs starting with 'U' or 'W' (e.g., `U12345`) → Auto-formatted as `<@ID>`
+- Pre-formatted strings (e.g., `<!subteam^S0AC8FPCFMW>`) → Used as-is
+- Special mentions (e.g., `<!here>`, `<!channel>`) → Used as-is
 
 ---
 
