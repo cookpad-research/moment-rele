@@ -218,6 +218,8 @@ jobs:
 
   notify:
     needs: [deploy]
+    # IMPORTANT: If you rename the deploy job, update both `needs:` AND the
+    # `needs.<job>.result` references below — they must match the job id exactly.
     if: always()
     runs-on: ubuntu-latest
     steps:
