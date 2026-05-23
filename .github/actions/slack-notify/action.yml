@@ -30,6 +30,10 @@ inputs:
     description: 'Changelog content (for releases)'
     required: false
     default: ''
+  commit:
+    description: 'Commit SHA to display (defaults to the workflow run commit)'
+    required: false
+    default: ${{ github.sha }}
   mentions:
     description: 'Slack user group IDs (e.g., "S0AC8FPCFMW") or user IDs (e.g., "U12345") to mention. Comma-separated for multiple. Can also use pre-formatted strings like "<!subteam^ID>"'
     required: false
@@ -81,6 +85,7 @@ runs:
           test) echo "prefix=Tests" >> $GITHUB_OUTPUT ;;
           ci) echo "prefix=CI" >> $GITHUB_OUTPUT ;;
           review) echo "prefix=Store Review" >> $GITHUB_OUTPUT ;;
+          ota) echo "prefix=OTA Update" >> $GITHUB_OUTPUT ;;
           *) echo "prefix=${{ inputs.type }}" >> $GITHUB_OUTPUT ;;
         esac
 
@@ -92,6 +97,7 @@ runs:
         INPUT_VERSION: ${{ inputs.version }}
         INPUT_ENVIRONMENT: ${{ inputs.environment }}
         INPUT_CHANGELOG: ${{ inputs.changelog }}
+        INPUT_COMMIT: ${{ inputs.commit }}
         INPUT_MENTIONS: ${{ inputs.mentions }}
         INPUT_MENTION_CONTEXT: ${{ inputs.mention-context }}
         STATUS_EMOJI: ${{ steps.styling.outputs.emoji }}
@@ -101,6 +107,7 @@ runs:
         REF_NAME: ${{ github.ref_name }}
         ACTOR: ${{ github.actor }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ inputs.commit }}
       run: |
         # Build fields array
         FIELDS=$(jq -n \
@@ -110,6 +117,13 @@ runs:
             {"type": "mrkdwn", "text": ("*Branch/Tag:*\n" + $ref)},
             {"type": "mrkdwn", "text": ("*Triggered by:*\n" + $actor)}
           ]')
+
+        # Add commit field if provided
+        if [ -n "$INPUT_COMMIT" ]; then
+          SHORT_SHA="${INPUT_COMMIT:0:7}"
+          FIELDS=$(echo "$FIELDS" | jq --arg sha "$SHORT_SHA" --arg url "$COMMIT_URL" \
+            '. + [{"type": "mrkdwn", "text": ("*Commit:*\n<" + $url + "|" + $sha + ">")}]')
+        fi
 
         # Add version field if provided
         if [ -n "$INPUT_VERSION" ]; then
