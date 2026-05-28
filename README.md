@@ -23,15 +23,30 @@ Send formatted Slack notifications for CI/CD events with consistent styling.
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `status` | Yes | - | Workflow status: `success`, `failure`, `cancelled` |
+| `status` | Yes | - | Workflow status: `success`, `failure`, `cancelled`, `in-progress` |
 | `type` | Yes | - | Notification type: `build`, `deploy-staging`, `deploy-production`, `release`, `test`, `ci`, `review` |
 | `title` | Yes | - | Notification title (e.g., "Learner App", "moment-web") |
-| `slack-webhook-url` | Yes | - | Slack incoming webhook URL |
+| `mode` | No | `webhook` | Notification mode: `webhook`, `start`, `finish` — see [Threaded Notifications](#threaded-notifications-with-analytics) |
+| `slack-webhook-url` | No* | `''` | Slack incoming webhook URL *(required when `mode: webhook`)* |
+| `slack-bot-token` | No* | `''` | Slack bot token (`xoxb-...`) *(required when `mode: start` or `mode: finish`)* |
+| `channel-id` | No* | `''` | Slack channel ID (`C...`) *(required when `mode: start` or `mode: finish`)* |
+| `message-ts` | No* | `''` | Timestamp of the parent message to update *(required when `mode: finish`)* |
+| `start-time` | No | `''` | Epoch seconds from the `start` step — used to compute duration |
 | `version` | No | `''` | App version to display |
 | `environment` | No | `''` | Environment name (staging/production) |
 | `changelog` | No | `''` | Changelog content for release notifications |
 | `mentions` | No | `''` | Slack user group IDs (e.g., `S0AC8FPCFMW`) or user IDs (e.g., `U12345`) to mention. Comma-separated for multiple. |
 | `mention-context` | No | `''` | Optional message to show with mentions (e.g., `"Please review:"`, `"FYI:"`) |
+
+#### Outputs
+
+These are only populated when `mode: start`.
+
+| Output | Description |
+|--------|-------------|
+| `message-ts` | Timestamp of the posted message — pass to `message-ts` input of the `finish` step |
+| `channel-id` | Channel the message was posted to — pass to `channel-id` input of the `finish` step |
+| `start-time` | Epoch seconds when the message was posted — pass to `start-time` input of the `finish` step |
 
 #### Usage
 
@@ -71,6 +86,121 @@ Environment: production
 
 View Details
 ```
+
+---
+
+### Threaded Notifications with Analytics
+
+Use `mode: start` + `mode: finish` to get a rich, living message for deploys and releases:
+
+- **Start** posts an "In Progress" message and reacts with `:ns_progress_indicator:`
+- **Finish** updates the original message in place with the final status, swaps the reaction (`:checkmark:` or `:x:`), and posts a threaded reply with a duration breakdown
+- Analytics fields added automatically: workflow/job name, started/finished timestamps, duration, release tag or PR link
+
+This requires a Slack bot token (`xoxb-...`) with `chat:write` and `reactions:write` scopes, plus a channel ID. The bot must have `chat:write.public` if it is not a member of the target channel.
+
+#### Example: Release with threaded notifications
+
+```yaml
+name: Deploy Production
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  start-notify:
+    runs-on: ubuntu-latest
+    outputs:
+      ts: ${{ steps.notify.outputs.message-ts }}
+      channel: ${{ steps.notify.outputs.channel-id }}
+      started: ${{ steps.notify.outputs.start-time }}
+    steps:
+      - name: Checkout moment-rele
+        uses: actions/checkout@v4
+        with:
+          repository: cookpad-research/moment-rele
+          ref: main
+          sparse-checkout: .github/actions
+          path: .moment-rele
+
+      - name: Notify deployment starting
+        id: notify
+        uses: ./.moment-rele/.github/actions/slack-notify
+        with:
+          mode: start
+          type: release
+          title: My App
+          version: ${{ github.event.release.tag_name }}
+          environment: production
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel-id: ${{ vars.SLACK_RELEASE_CHANNEL_ID }}
+          status: in-progress  # optional — start mode forces this anyway
+
+  deploy:
+    needs: [start-notify]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to production
+        run: echo "Deploying..."
+
+  finish-notify:
+    needs: [start-notify, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          elif [[ "${{ needs.deploy.result }}" == "cancelled" ]]; then
+            echo "status=cancelled" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout moment-rele
+        uses: actions/checkout@v4
+        with:
+          repository: cookpad-research/moment-rele
+          ref: main
+          sparse-checkout: .github/actions
+          path: .moment-rele
+
+      - name: Notify deployment result
+        uses: ./.moment-rele/.github/actions/slack-notify
+        with:
+          mode: finish
+          type: release
+          title: My App
+          status: ${{ steps.status.outputs.status }}
+          version: ${{ github.event.release.tag_name }}
+          environment: production
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel-id: ${{ needs.start-notify.outputs.channel }}
+          message-ts: ${{ needs.start-notify.outputs.ts }}
+          start-time: ${{ needs.start-notify.outputs.started }}
+```
+
+The `start-notify` job's outputs wire directly into `finish-notify` — no extra state management needed.
+
+#### What each mode does
+
+| Mode | Slack API calls | Effect |
+|------|----------------|--------|
+| `start` | `chat.postMessage`, `reactions.add` | New message with `:ns_progress_indicator:` reaction |
+| `finish` (success) | `chat.update`, `reactions.remove`, `reactions.add`, `chat.postMessage` | Updates parent to ✅, swaps reaction to `:checkmark:`, posts thread reply |
+| `finish` (failure/cancelled) | same | Updates parent to ❌/⚠️, swaps reaction to `:x:`, posts thread reply |
+
+#### Required secrets / variables
+
+| Name | Type | Description |
+|------|------|-------------|
+| `SLACK_BOT_TOKEN` | Secret | xoxb bot token with `chat:write`, `chat:write.public`, `reactions:write` |
+| `SLACK_RELEASE_CHANNEL_ID` | Variable | Channel ID (e.g., `C01234ABCDE`) to post into |
+
+---
 
 #### Mention Support
 
@@ -264,13 +394,20 @@ jobs:
 
 ## Required Secrets
 
-Each repository using these actions needs the following secret:
+### For `mode: webhook` (existing behaviour)
 
 | Secret | Description |
 |--------|-------------|
 | `SLACK_WEBHOOK_URL` | Slack incoming webhook URL for your notification channel |
 
-### Setting up Slack Webhook
+### For `mode: start` / `mode: finish` (threaded notifications)
+
+| Name | Type | Description |
+|------|------|-------------|
+| `SLACK_BOT_TOKEN` | Secret | Slack bot token (`xoxb-...`) with `chat:write`, `chat:write.public`, `reactions:write` |
+| `SLACK_RELEASE_CHANNEL_ID` | Variable | Channel ID (e.g., `C01234ABCDE`) — find it in the channel's Slack settings |
+
+### Setting up Slack Webhook (webhook mode)
 
 1. Go to your Slack workspace's App Directory
 2. Search for "Incoming Webhooks" or create a new Slack App

@@ -7,7 +7,7 @@ branding:
 
 inputs:
   status:
-    description: 'Workflow status: success, failure, cancelled'
+    description: 'Workflow status: success, failure, cancelled, in-progress'
     required: true
   type:
     description: 'Notification type: build, deploy-staging, deploy-production, release, test, ci, review'
@@ -16,8 +16,29 @@ inputs:
     description: 'Notification title (e.g., app name)'
     required: true
   slack-webhook-url:
-    description: 'Slack incoming webhook URL'
-    required: true
+    description: 'Slack incoming webhook URL (required when mode is webhook)'
+    required: false
+    default: ''
+  mode:
+    description: 'Notification mode: webhook (default), start, finish'
+    required: false
+    default: 'webhook'
+  slack-bot-token:
+    description: 'Slack bot token (xoxb-...) for Web API calls (required when mode is start or finish)'
+    required: false
+    default: ''
+  channel-id:
+    description: 'Slack channel ID (C...) to post into (required when mode is start or finish)'
+    required: false
+    default: ''
+  message-ts:
+    description: 'Timestamp of the parent message to update and reply under (required when mode is finish)'
+    required: false
+    default: ''
+  start-time:
+    description: 'Epoch seconds from the start step, used to compute duration (used when mode is finish)'
+    required: false
+    default: ''
   version:
     description: 'App version'
     required: false
@@ -43,14 +64,58 @@ inputs:
     required: false
     default: ''
 
+outputs:
+  message-ts:
+    description: 'Timestamp of the posted message (populated when mode is start)'
+    value: ${{ steps.send.outputs.message-ts }}
+  channel-id:
+    description: 'Channel ID the message was posted to (populated when mode is start)'
+    value: ${{ steps.send.outputs.channel-id }}
+  start-time:
+    description: 'Epoch seconds when the start message was posted (populated when mode is start)'
+    value: ${{ steps.send.outputs.start-time }}
+
 runs:
   using: 'composite'
   steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        MODE="${{ inputs.mode }}"
+        if [ "$MODE" != "webhook" ] && [ "$MODE" != "start" ] && [ "$MODE" != "finish" ]; then
+          echo "::error::Invalid mode '$MODE'. Must be one of: webhook, start, finish"
+          exit 1
+        fi
+        if [ "$MODE" = "webhook" ] && [ -z "${{ inputs.slack-webhook-url }}" ]; then
+          echo "::error::slack-webhook-url is required when mode is 'webhook'"
+          exit 1
+        fi
+        if [ "$MODE" = "start" ] || [ "$MODE" = "finish" ]; then
+          if [ -z "${{ inputs.slack-bot-token }}" ]; then
+            echo "::error::slack-bot-token is required when mode is '$MODE'"
+            exit 1
+          fi
+          if [ -z "${{ inputs.channel-id }}" ]; then
+            echo "::error::channel-id is required when mode is '$MODE'"
+            exit 1
+          fi
+        fi
+        if [ "$MODE" = "finish" ] && [ -z "${{ inputs.message-ts }}" ]; then
+          echo "::error::message-ts is required when mode is 'finish'"
+          exit 1
+        fi
+
     - name: Determine status styling
       id: styling
       shell: bash
       run: |
-        case "${{ inputs.status }}" in
+        # start mode always shows in-progress regardless of what the caller passed
+        STATUS="${{ inputs.status }}"
+        if [ "${{ inputs.mode }}" = "start" ]; then
+          STATUS="in-progress"
+        fi
+
+        case "$STATUS" in
           success)
             echo "color=good" >> $GITHUB_OUTPUT
             echo "emoji=:white_check_mark:" >> $GITHUB_OUTPUT
@@ -65,6 +130,11 @@ runs:
             echo "color=warning" >> $GITHUB_OUTPUT
             echo "emoji=:warning:" >> $GITHUB_OUTPUT
             echo "status_text=Cancelled" >> $GITHUB_OUTPUT
+            ;;
+          in-progress)
+            echo "color=#FFA500" >> $GITHUB_OUTPUT
+            echo "emoji=:hourglass_flowing_sand:" >> $GITHUB_OUTPUT
+            echo "status_text=In Progress" >> $GITHUB_OUTPUT
             ;;
           *)
             echo "color=#808080" >> $GITHUB_OUTPUT
@@ -89,6 +159,45 @@ runs:
           *) echo "prefix=${{ inputs.type }}" >> $GITHUB_OUTPUT ;;
         esac
 
+    - name: Compute analytics fields
+      id: analytics
+      shell: bash
+      env:
+        INPUT_START_TIME: ${{ inputs.start-time }}
+        EVENT_NAME: ${{ github.event_name }}
+        SERVER_URL: ${{ github.server_url }}
+        REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        TAG_NAME: ${{ github.event.release.tag_name }}
+      run: |
+        NOW=$(date +%s)
+        echo "now=$NOW" >> $GITHUB_OUTPUT
+
+        NOW_FALLBACK=$(date -u '+%Y-%m-%d %H:%M UTC')
+        echo "now_formatted=<!date^${NOW}^{date_short_pretty} at {time}|${NOW_FALLBACK}>" >> $GITHUB_OUTPUT
+
+        if [ -n "$INPUT_START_TIME" ]; then
+          STARTED_FALLBACK=$(date -u -d @"${INPUT_START_TIME}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "${INPUT_START_TIME}")
+          echo "started_at=<!date^${INPUT_START_TIME}^{date_short_pretty} at {time}|${STARTED_FALLBACK}>" >> $GITHUB_OUTPUT
+
+          DURATION=$(( NOW - INPUT_START_TIME ))
+          MINS=$(( DURATION / 60 ))
+          SECS=$(( DURATION % 60 ))
+          if [ "$MINS" -gt 0 ]; then
+            echo "duration=${MINS}m ${SECS}s" >> $GITHUB_OUTPUT
+          else
+            echo "duration=${SECS}s" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+        if [ "$EVENT_NAME" = "release" ] && [ -n "$TAG_NAME" ]; then
+          echo "release_link=<${SERVER_URL}/${REPOSITORY}/releases/tag/${TAG_NAME}|${TAG_NAME}>" >> $GITHUB_OUTPUT
+        fi
+
+        if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_NUMBER" ]; then
+          echo "pr_link=<${SERVER_URL}/${REPOSITORY}/pull/${PR_NUMBER}|#${PR_NUMBER}>" >> $GITHUB_OUTPUT
+        fi
+
     - name: Build payload JSON
       id: build-payload
       shell: bash
@@ -100,14 +209,22 @@ runs:
         INPUT_COMMIT: ${{ inputs.commit }}
         INPUT_MENTIONS: ${{ inputs.mentions }}
         INPUT_MENTION_CONTEXT: ${{ inputs.mention-context }}
+        INPUT_MODE: ${{ inputs.mode }}
         STATUS_EMOJI: ${{ steps.styling.outputs.emoji }}
         STATUS_TEXT: ${{ steps.styling.outputs.status_text }}
         STATUS_COLOR: ${{ steps.styling.outputs.color }}
         TYPE_PREFIX: ${{ steps.type-prefix.outputs.prefix }}
         REF_NAME: ${{ github.ref_name }}
         ACTOR: ${{ github.actor }}
+        WORKFLOW: ${{ github.workflow }}
+        JOB: ${{ github.job }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ inputs.commit }}
+        ANALYTICS_NOW_FORMATTED: ${{ steps.analytics.outputs.now_formatted }}
+        ANALYTICS_STARTED: ${{ steps.analytics.outputs.started_at }}
+        ANALYTICS_DURATION: ${{ steps.analytics.outputs.duration }}
+        ANALYTICS_RELEASE: ${{ steps.analytics.outputs.release_link }}
+        ANALYTICS_PR: ${{ steps.analytics.outputs.pr_link }}
       run: |
         # Build fields array
         FIELDS=$(jq -n \
@@ -133,6 +250,40 @@ runs:
         # Add environment field if provided
         if [ -n "$INPUT_ENVIRONMENT" ]; then
           FIELDS=$(echo "$FIELDS" | jq --arg e "$INPUT_ENVIRONMENT" '. + [{"type": "mrkdwn", "text": ("*Environment:*\n" + $e)}]')
+        fi
+
+        # Add analytics fields for threaded modes
+        if [ "$INPUT_MODE" != "webhook" ]; then
+          FIELDS=$(echo "$FIELDS" | jq --arg w "$WORKFLOW / $JOB" \
+            '. + [{"type": "mrkdwn", "text": ("*Workflow:*\n" + $w)}]')
+
+          if [ -n "$ANALYTICS_RELEASE" ]; then
+            FIELDS=$(echo "$FIELDS" | jq --arg r "$ANALYTICS_RELEASE" \
+              '. + [{"type": "mrkdwn", "text": ("*Release:*\n" + $r)}]')
+          fi
+
+          if [ -n "$ANALYTICS_PR" ]; then
+            FIELDS=$(echo "$FIELDS" | jq --arg p "$ANALYTICS_PR" \
+              '. + [{"type": "mrkdwn", "text": ("*Pull Request:*\n" + $p)}]')
+          fi
+
+          if [ "$INPUT_MODE" = "start" ]; then
+            FIELDS=$(echo "$FIELDS" | jq --arg s "$ANALYTICS_NOW_FORMATTED" \
+              '. + [{"type": "mrkdwn", "text": ("*Started:*\n" + $s)}]')
+          fi
+
+          if [ "$INPUT_MODE" = "finish" ]; then
+            if [ -n "$ANALYTICS_STARTED" ]; then
+              FIELDS=$(echo "$FIELDS" | jq --arg s "$ANALYTICS_STARTED" \
+                '. + [{"type": "mrkdwn", "text": ("*Started:*\n" + $s)}]')
+            fi
+            FIELDS=$(echo "$FIELDS" | jq --arg f "$ANALYTICS_NOW_FORMATTED" \
+              '. + [{"type": "mrkdwn", "text": ("*Finished:*\n" + $f)}]')
+            if [ -n "$ANALYTICS_DURATION" ]; then
+              FIELDS=$(echo "$FIELDS" | jq --arg d "$ANALYTICS_DURATION" \
+                '. + [{"type": "mrkdwn", "text": ("*Duration:*\n" + $d)}]')
+            fi
+          fi
         fi
 
         # Process mentions if provided
@@ -246,22 +397,152 @@ runs:
             ]
           }')
 
-        # Save to file
         echo "$PAYLOAD" > /tmp/slack-payload.json
 
+        # Build thread reply payload for finish mode (status summary + duration breakdown)
+        if [ "$INPUT_MODE" = "finish" ]; then
+          jq -n \
+            --arg color "$STATUS_COLOR" \
+            --arg emoji "$STATUS_EMOJI" \
+            --arg title "$INPUT_TITLE" \
+            --arg prefix "$TYPE_PREFIX" \
+            --arg status "$STATUS_TEXT" \
+            --arg duration "$ANALYTICS_DURATION" \
+            --arg started "$ANALYTICS_STARTED" \
+            --arg finished "$ANALYTICS_NOW_FORMATTED" \
+            --arg url "$RUN_URL" \
+            '{
+              "attachments": [
+                {
+                  "color": $color,
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                          $emoji + " *" + $title + " - " + $prefix + " " + $status + "*"
+                          + (if $duration != "" then "\n:stopwatch: *Duration:* " + $duration else "" end)
+                          + (if $started != "" then "\n:calendar: *Started:* " + $started else "" end)
+                          + "\n:calendar: *Finished:* " + $finished
+                        )
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "text": {"type": "mrkdwn", "text": ("<" + $url + "|View Details>")}
+                    }
+                  ]
+                }
+              ]
+            }' > /tmp/slack-reply-payload.json
+        fi
+
     - name: Send Slack notification
+      id: send
       shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_BOT_TOKEN: ${{ inputs.slack-bot-token }}
+        INPUT_CHANNEL_ID: ${{ inputs.channel-id }}
+        INPUT_MESSAGE_TS: ${{ inputs.message-ts }}
+        INPUT_STATUS: ${{ inputs.status }}
       run: |
-        response=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.slack-webhook-url }}" \
-          -H 'Content-type: application/json' \
-          -d @/tmp/slack-payload.json)
+        slack_api() {
+          local endpoint="$1"
+          local data="$2"
+          curl -s -X POST "https://slack.com/api/${endpoint}" \
+            -H "Authorization: Bearer $INPUT_BOT_TOKEN" \
+            -H "Content-type: application/json" \
+            -d "$data"
+        }
 
-        http_code=$(echo "$response" | tail -n1)
-        body=$(echo "$response" | sed '$d')
+        if [ "$INPUT_MODE" = "webhook" ]; then
+          # --- Webhook mode (unchanged behaviour) ---
+          response=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.slack-webhook-url }}" \
+            -H 'Content-type: application/json' \
+            -d @/tmp/slack-payload.json)
 
-        if [ "$http_code" != "200" ]; then
-          echo "::warning::Slack notification failed with HTTP $http_code: $body"
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" != "200" ]; then
+            echo "::warning::Slack notification failed with HTTP $http_code: $body"
+          fi
+
+        elif [ "$INPUT_MODE" = "start" ]; then
+          # --- Start mode: post new message, react with in-progress indicator ---
+          START_TIME=$(date +%s)
+
+          PAYLOAD=$(jq --arg ch "$INPUT_CHANNEL_ID" '. + {channel: $ch}' /tmp/slack-payload.json)
+          response=$(slack_api "chat.postMessage" "$PAYLOAD")
+
+          ok=$(echo "$response" | jq -r '.ok')
+          ts=$(echo "$response" | jq -r '.ts // empty')
+          err=$(echo "$response" | jq -r '.error // "unknown error"')
+
+          if [ "$ok" != "true" ]; then
+            echo "::error::Slack chat.postMessage failed: $err"
+            exit 1
+          fi
+
+          # Add in-progress reaction (soft failure — reaction is non-critical)
+          react_response=$(slack_api "reactions.add" \
+            "{\"channel\": \"$INPUT_CHANNEL_ID\", \"name\": \"ns_progress_indicator\", \"timestamp\": \"$ts\"}")
+          react_ok=$(echo "$react_response" | jq -r '.ok')
+          react_err=$(echo "$react_response" | jq -r '.error // empty')
+          if [ "$react_ok" != "true" ] && [ "$react_err" != "already_reacted" ]; then
+            echo "::warning::Slack reactions.add (ns_progress_indicator) failed: $react_err"
+          fi
+
+          echo "message-ts=$ts" >> $GITHUB_OUTPUT
+          echo "channel-id=$INPUT_CHANNEL_ID" >> $GITHUB_OUTPUT
+          echo "start-time=$START_TIME" >> $GITHUB_OUTPUT
+
+        elif [ "$INPUT_MODE" = "finish" ]; then
+          # --- Finish mode: update parent, swap reactions, post thread reply ---
+
+          # 1. Update parent message in place
+          UPDATE_PAYLOAD=$(jq \
+            --arg ch "$INPUT_CHANNEL_ID" \
+            --arg ts "$INPUT_MESSAGE_TS" \
+            '. + {channel: $ch, ts: $ts}' /tmp/slack-payload.json)
+
+          update_response=$(slack_api "chat.update" "$UPDATE_PAYLOAD")
+          if [ "$(echo "$update_response" | jq -r '.ok')" != "true" ]; then
+            echo "::warning::Slack chat.update failed: $(echo "$update_response" | jq -r '.error // "unknown error"')"
+          fi
+
+          # 2. Remove in-progress reaction (tolerate if it was never added)
+          slack_api "reactions.remove" \
+            "{\"channel\": \"$INPUT_CHANNEL_ID\", \"name\": \"ns_progress_indicator\", \"timestamp\": \"$INPUT_MESSAGE_TS\"}" > /dev/null
+
+          # 3. Add outcome reaction
+          if [ "$INPUT_STATUS" = "success" ]; then
+            OUTCOME_EMOJI="checkmark"
+          else
+            OUTCOME_EMOJI="x"
+          fi
+
+          react_response=$(slack_api "reactions.add" \
+            "{\"channel\": \"$INPUT_CHANNEL_ID\", \"name\": \"$OUTCOME_EMOJI\", \"timestamp\": \"$INPUT_MESSAGE_TS\"}")
+          react_ok=$(echo "$react_response" | jq -r '.ok')
+          react_err=$(echo "$react_response" | jq -r '.error // empty')
+          if [ "$react_ok" != "true" ] && [ "$react_err" != "already_reacted" ]; then
+            echo "::warning::Slack reactions.add ($OUTCOME_EMOJI) failed: $react_err"
+          fi
+
+          # 4. Post thread reply
+          REPLY_PAYLOAD=$(jq \
+            --arg ch "$INPUT_CHANNEL_ID" \
+            --arg tts "$INPUT_MESSAGE_TS" \
+            '. + {channel: $ch, thread_ts: $tts}' /tmp/slack-reply-payload.json)
+
+          reply_response=$(slack_api "chat.postMessage" "$REPLY_PAYLOAD")
+          if [ "$(echo "$reply_response" | jq -r '.ok')" != "true" ]; then
+            echo "::warning::Slack thread reply failed: $(echo "$reply_response" | jq -r '.error // "unknown error"')"
+          fi
         fi
 
         # Clean up
-        rm -f /tmp/slack-payload.json
+        rm -f /tmp/slack-payload.json /tmp/slack-reply-payload.json
