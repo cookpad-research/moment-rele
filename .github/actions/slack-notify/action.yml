@@ -52,7 +52,7 @@ runs:
       run: |
         case "${{ inputs.status }}" in
           success)
-            echo "color=good" >> $GITHUB_OUTPUT
+            echo "color=#2EB886" >> $GITHUB_OUTPUT
             echo "emoji=:white_check_mark:" >> $GITHUB_OUTPUT
             echo "status_text=Success" >> $GITHUB_OUTPUT
             ;;
