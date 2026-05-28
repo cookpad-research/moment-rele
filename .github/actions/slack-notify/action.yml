@@ -122,12 +122,12 @@ runs:
             echo "status_text=Success" >> $GITHUB_OUTPUT
             ;;
           failure)
-            echo "color=danger" >> $GITHUB_OUTPUT
+            echo "color=#E01E5A" >> $GITHUB_OUTPUT
             echo "emoji=:x:" >> $GITHUB_OUTPUT
             echo "status_text=Failed" >> $GITHUB_OUTPUT
             ;;
           cancelled)
-            echo "color=warning" >> $GITHUB_OUTPUT
+            echo "color=#ECB22E" >> $GITHUB_OUTPUT
             echo "emoji=:warning:" >> $GITHUB_OUTPUT
             echo "status_text=Cancelled" >> $GITHUB_OUTPUT
             ;;
